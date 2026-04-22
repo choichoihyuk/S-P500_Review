@@ -8,7 +8,8 @@ on:
   workflow_dispatch: {}  # 수동 트리거 (Actions 탭에서 "Run workflow")
 
 permissions:
-  contents: read
+  # watchlist.json 변경 자동 커밋을 위해 write 필요
+  contents: write
 
 # 이전 실행이 지연돼 다음 실행과 겹치면 큐에 대기 (중복 실행 방지)
 concurrency:
@@ -47,6 +48,20 @@ jobs:
 
       - name: Run daily report
         run: python -m src.main
+
+      # watchlist.json 이 run 중에 변경됐다면 자동 커밋 (push는 새 workflow 트리거 X)
+      - name: Commit watchlist changes
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain data/watchlist.json 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/watchlist.json
+            git commit -m "chore: update watchlist [skip ci]"
+            git push
+          else
+            echo "watchlist 변경 없음"
+          fi
 
       - name: Upload logs on failure
         if: failure()

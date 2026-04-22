@@ -24,12 +24,14 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config.settings import LOG_DIR, LOG_LEVEL, TIMEZONE  # noqa: E402
+from config.settings import LOG_DIR, LOG_LEVEL, TELEGRAM_CHANNEL_ID, TIMEZONE  # noqa: E402
 from src.analysis.rankings import (  # noqa: E402
+    RankedStock,
     top_by_market_cap,
     top_by_turnover_ratio,
     top_gainers_losers,
 )
+from src.data import watchlist as watchlist_state  # noqa: E402
 from src.data.market_calendar import (  # noqa: E402
     get_previous_market_day,
     is_nyse_open_on,
@@ -38,6 +40,11 @@ from src.data.market_calendar import (  # noqa: E402
 from src.data.market_data import fetch_market_data  # noqa: E402
 from src.data.sp500_list import get_sp500_tickers  # noqa: E402
 from src.news.news_fetcher import fetch_news_batch  # noqa: E402
+from src.telegram_bot.commands import (  # noqa: E402
+    fetch_updates,
+    format_ack_message,
+    process_updates,
+)
 from src.telegram_bot.formatter import format_full_report  # noqa: E402
 from src.telegram_bot.sender import send_message, send_messages  # noqa: E402
 
@@ -84,6 +91,79 @@ def _setup_logging() -> None:
         enqueue=False,
     )
     _logging_configured = True
+
+
+def _build_watchlist_stocks(df, watchlist_tickers: list[str]) -> list[RankedStock]:
+    """관심종목용 RankedStock 리스트를 df에서 추출.
+
+    - 순위가 아니므로 등락률 내림차순 정렬 (상승 위, 하락 아래).
+    - df에 없는 티커(fetch 실패)는 스킵.
+    """
+    if not watchlist_tickers:
+        return []
+    sub = df[df["ticker"].isin(watchlist_tickers)].copy()
+    if sub.empty:
+        return []
+    sub = sub.sort_values("change_pct", ascending=False)
+    stocks: list[RankedStock] = []
+    for _, row in sub.iterrows():
+        stocks.append(
+            RankedStock(
+                ticker=str(row["ticker"]),
+                name=str(row["name"]),
+                change_pct=float(row["change_pct"]),
+                market_cap=float(row["market_cap"]),
+                dollar_volume=float(row["dollar_volume"]),
+                turnover_ratio=float(row["turnover_ratio"]),
+                rank_reason="관심종목",
+            )
+        )
+    return stocks
+
+
+def _process_user_commands() -> list[str]:
+    """getUpdates 풀링 → watchlist 갱신·파일 저장. ack 메시지는 best-effort 전송.
+
+    Returns:
+        최신 watchlist 티커 리스트 (비어있을 수 있음). pipeline은 이 리스트를 사용.
+    """
+    state = watchlist_state.load()
+    try:
+        updates = fetch_updates(state.last_update_id)
+    except Exception as e:
+        logger.warning(f"getUpdates 실패 — 기존 watchlist만 사용: {e}")
+        return list(state.tickers)
+
+    new_tickers, max_uid, outcome = process_updates(
+        updates, state.tickers, authorized_chat_id=TELEGRAM_CHANNEL_ID
+    )
+    changed = (new_tickers != state.tickers) or (max_uid > state.last_update_id)
+
+    state.tickers = new_tickers
+    if max_uid > state.last_update_id:
+        state.last_update_id = max_uid
+
+    if changed:
+        watchlist_state.save(state)
+        logger.info(
+            f"[0.5/6] watchlist: {len(new_tickers)}종목 "
+            f"(+{len(outcome.added)}/-{len(outcome.removed)}), offset={max_uid}"
+        )
+    else:
+        logger.info("[0.5/6] watchlist: 변경 없음")
+
+    # 유저 피드백 — 전송 실패해도 파이프라인은 계속
+    if outcome.has_feedback():
+        try:
+            ack = (
+                "<b>🤖 관심종목 업데이트</b>\n"
+                + format_ack_message(outcome, new_tickers)
+            )
+            send_message(ack)
+        except Exception as e:
+            logger.warning(f"ack 메시지 전송 실패(무시): {e}")
+
+    return new_tickers
 
 
 def _check_data_health(df, total_tickers: int) -> None:
@@ -156,7 +236,12 @@ def run_daily_report(*, force: bool = False) -> None:
 
     # 0. 휴장일 가드 — 07:00 KST 시점의 ET 날짜가 개장일이 아니면 리포트 스킵
     today_et = today_in_et()
-    if not force and not is_nyse_open_on(today_et):
+    is_open = is_nyse_open_on(today_et)
+
+    # 0.5. 유저 커맨드 처리 (getUpdates) — 휴장일에도 가능, 다음 개장일 리포트에 반영됨
+    watchlist_tickers = _process_user_commands()
+
+    if not force and not is_open:
         logger.info(f"NYSE 휴장({today_et}) — 리포트 스킵")
         _notify_holiday(today_et, now_kst)
         return
@@ -166,33 +251,45 @@ def run_daily_report(*, force: bool = False) -> None:
         t0 = time.monotonic()
         sp500 = get_sp500_tickers()
         name_map = {t["ticker"]: t["name"] for t in sp500}
-        tickers = [t["ticker"] for t in sp500]
+        sp500_set = {t["ticker"] for t in sp500}
+        # watchlist에서 S&P 500 밖의 종목만 추가 fetch 대상
+        extra_watch = [t for t in watchlist_tickers if t not in sp500_set]
+        tickers = [t["ticker"] for t in sp500] + extra_watch
         logger.info(
-            f"[1/6] S&P 500 리스트: {len(sp500)}개 종목, {time.monotonic() - t0:.1f}s"
+            f"[1/6] S&P 500 {len(sp500)}개 + watchlist 추가 {len(extra_watch)}개 "
+            f"= {len(tickers)}개 종목, {time.monotonic() - t0:.1f}s"
         )
 
         # 2. 시장 데이터
         # use_cache=True: 10분 TTL. 일 1회 07:00 운영에선 항상 expire되어 영향 없고,
         # 수동 재실행 시 yfinance rate limit 회피.
         t0 = time.monotonic()
-        df = fetch_market_data(tickers, name_map=name_map, use_cache=True)
+        df = fetch_market_data(tickers, name_map=name_map, use_cache=False)
         logger.info(
             f"[2/6] market data: {len(df)}/{len(tickers)}, "
             f"{time.monotonic() - t0:.1f}s"
         )
-        _check_data_health(df, total_tickers=len(tickers))
+        # 건강 체크는 S&P 500 대상만 (extra_watch는 소수라 노이즈)
+        _check_data_health(df[df["ticker"].isin(sp500_set)], total_tickers=len(sp500))
 
-        # 3. 순위 3종
+        # 3. 순위 3종 — 순위는 S&P 500만 대상
         t0 = time.monotonic()
-        mc_top = top_by_market_cap(df)
-        gainers, losers = top_gainers_losers(df)
-        turnover_top = top_by_turnover_ratio(df)
-        logger.info(f"[3/6] 순위 3종 계산 완료, {time.monotonic() - t0:.1f}s")
+        sp500_df = df[df["ticker"].isin(sp500_set)]
+        mc_top = top_by_market_cap(sp500_df)
+        gainers, losers = top_gainers_losers(sp500_df)
+        turnover_top = top_by_turnover_ratio(sp500_df)
 
-        # 4. 뉴스 — 순위에 등장한 unique 티커만
+        # 관심종목 RankedStock — df에서 해당 티커만 추출
+        watchlist_stocks = _build_watchlist_stocks(df, watchlist_tickers)
+        logger.info(
+            f"[3/6] 순위 3종 + watchlist {len(watchlist_stocks)}종목, "
+            f"{time.monotonic() - t0:.1f}s"
+        )
+
+        # 4. 뉴스 — 순위에 등장한 unique 티커 ∪ watchlist
         t0 = time.monotonic()
         unique_tickers: set[str] = set()
-        for lst in (mc_top, gainers, losers, turnover_top):
+        for lst in (mc_top, gainers, losers, turnover_top, watchlist_stocks):
             for s in lst:
                 unique_tickers.add(s.ticker)
         news_map = fetch_news_batch(sorted(unique_tickers))
@@ -205,7 +302,8 @@ def run_daily_report(*, force: bool = False) -> None:
         # 5. 메시지 포맷
         t0 = time.monotonic()
         messages = format_full_report(
-            mc_top, gainers, losers, turnover_top, news_map, now_kst=now_kst
+            mc_top, gainers, losers, turnover_top, news_map,
+            now_kst=now_kst, watchlist=watchlist_stocks,
         )
         logger.info(
             f"[5/6] 메시지 {len(messages)}건 포맷 "

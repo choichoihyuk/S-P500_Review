@@ -172,3 +172,26 @@
   - GH 스케줄러는 best-effort (고부하 시 몇 분 지연 가능) — 일일 리포트엔 허용 범위.
   - yfinance는 GH Actions IP를 rate limit할 가능성 — Phase 1/2에서 구축한 재시도·지수 백오프로 대부분 해결. 심하면 scheduler 스펙을 분 단위로 분산(예: `15 22 * * *`)하거나 데이터 소스 교체.
 - **Git 안전성 (pre-commit dry-run)**: `git add -n .` 결과 29파일 staged. `.env`·`logs/`·`data/cache/`·`__pycache__/` 모두 정상 제외. `.env.example`은 placeholder로 올라감 — OK.
+
+## 관심종목 기능 (2026-04-22 추가) ☑
+- **목표**: 사용자가 봇 DM에 티커 입력 → 다음 리포트부터 **📌 내 관심종목** 섹션에 등락률 + 뉴스 포함.
+- **새 모듈**:
+  - `src/data/watchlist.py`: `data/watchlist.json`에 `{tickers, last_update_id}` persist. repo에 커밋.
+  - `src/telegram_bot/commands.py`: `fetch_updates` (getUpdates) + `process_updates` (파싱/인증) + `format_ack_message`.
+- **수정 모듈**:
+  - `src/telegram_bot/formatter.py`: `format_full_report(..., watchlist=None)` — 비어있으면 섹션 미추가, 있으면 5번째 섹션.
+  - `src/main.py`: 단계 0.5 `_process_user_commands()`, 단계 1에서 S&P500 + watchlist extras 합쳐 fetch, 단계 3에서 `_build_watchlist_stocks()`로 RankedStock 구성, 단계 4 뉴스 대상에 합류, 단계 5 포매터에 watchlist 인자로 전달. `_check_data_health`는 S&P500 서브셋만으로 평가.
+  - `.github/workflows/daily-report.yml`: `permissions: contents: write` + "Commit watchlist changes" 스텝 (`[skip ci]` 로 재트리거 방지).
+- **커맨드 문법**:
+  - 티커: `BE`, 복수: `NVDA MSFT AAPL` (공백/쉼표/개행), 제거: `-BE`
+  - 슬래시: `/list`(조회), `/clear`(초기화), `/start`·`/help`(현재 상태 표시)
+  - 정규화: 소문자 → 대문자, `BRK.B` → `BRK-B`
+- **인증**: `TELEGRAM_CHANNEL_ID`와 일치하는 chat_id(숫자) 또는 `@username`만 처리. 타 유저 `/start` 안전 무시.
+- **offset 관리**: Telegram getUpdates는 `offset`으로 cursor 진행. watchlist.json에 `last_update_id` 저장 → 중복 수신 방지. 미인증 메시지도 offset은 전진 (재처리 비용 제로).
+- **테스트**: `tests/test_commands.py` 17 케이스 (parsing·normalize·unauth·multiline·comma·offset) — 전체 pytest **62 passed**.
+- **E2E sim**: mocked getUpdates([{text:"BE"}]) + mocked market data w/ synthetic BE row → `📌 내 관심종목` 섹션에 `BE Bloom Energy +12.50%` 렌더링 확인. watchlist.json에 `{"tickers":["BE"], "last_update_id":999}` 저장 확인.
+- **주의점**:
+  - GH Actions 첫 실행 때 repo의 **Settings → Actions → General → Workflow permissions** 가 "Read and write permissions"여야 auto-commit 동작. 기본값은 "Read repository contents" 뿐.
+  - `data/cache/` 는 gitignored이지만 `data/watchlist.json`은 커밋 대상 — 경로 분리 의도적.
+  - 미인증 메시지도 offset 전진: 공개 채널에서 타인이 스팸해도 무한 루프 없음.
+  - main.py의 `use_cache=True` 는 watchlist 기능 추가로 `use_cache=False`로 회귀 (새 티커 추가 시 stale 캐시 피하기 위해).

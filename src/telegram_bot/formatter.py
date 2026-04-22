@@ -127,20 +127,27 @@ def format_full_report(
     turnover_top: list[RankedStock],
     news_map: dict[str, list[NewsItem]],
     now_kst: datetime | None = None,
+    watchlist: list[RankedStock] | None = None,
 ) -> list[str]:
     """전체 리포트를 텔레그램 메시지 리스트로 반환.
 
-    헤더 + 4섹션을 렌더링하고, 섹션 단위로 메시지를 분할.
+    헤더 + 4~5섹션을 렌더링하고, 섹션 단위로 메시지를 분할.
     헤더는 첫 섹션과 합칠 수 있으면 합침 (메시지 개수 절약).
+
+    Args:
+        watchlist: 사용자 관심종목 (비어있으면 섹션 미추가).
     """
     header = _format_header(now_kst)
 
-    sections_raw = [
+    sections_raw: list[tuple[str, list[RankedStock]]] = [
         ("시가총액 Top 10", market_cap_top),
         ("일일 상승률 Top 10", gainers),
         ("일일 하락률 Top 10", losers),
         ("시총 대비 거래대금 비율 Top 10", turnover_top),
     ]
+    if watchlist:
+        # 관심종목은 "섹션 5"로 맨 뒤에 — 사용자가 추가한 맥락
+        sections_raw.append(("📌 내 관심종목", watchlist))
     sections = [format_section(t, items, news_map) for t, items in sections_raw]
 
     messages: list[str] = []
